@@ -1,14 +1,12 @@
 from algorithm import sum
-from algorithm import vectorize, parallelize
+from algorithm import vectorize, parallelize, unroll
 from builtin import string
 from math import round
 from memory import memset_zero, memcpy
 from memory.buffer import Buffer
 from memory.unsafe import DTypePointer
-from python import Python
 from random import rand
-from read import BufReader, File
-from runtime.llcl import num_cores, Runtime
+from runtime.llcl import num_cores
 from sys import argv
 from tensor import Tensor, TensorShape, TensorSpec
 
@@ -21,7 +19,7 @@ import time
 
 var workers = 0
 
-alias nelts = (2*simdwidthof[DType.float32]())
+alias nelts = (4*simdwidthof[DType.float32]())
 
 alias PointerString = Pointer[UInt8]
 alias BufferPtrType = DTypePointer[DType.uint8]
@@ -282,11 +280,24 @@ struct Tokenizer:
 
         # read vocab_scores & vocab values (tokens)
         for i in range(0, self.vocab_size):
-            self.vocab_scores.store(i, read_val_float32(buf))
+            let score = read_val_float32(buf)
             let slen = read_val_int(buf)
-            self.vocab.store(i, read_val_str(buf, slen))
-
+            let token = read_val_str(buf, slen)
+            self.store_token(i, token, score)
         return None
+
+    fn __del__(owned self):
+        for i in range(0, self.vocab_size):
+            self.vocab[i].free()
+        self.vocab.free()
+        self.vocab_scores.free()
+        self.sorted_vocab.free()
+
+    fn store_token(
+        inout self, index: Int, owned token: PointerString, score: Float32
+    ) -> None:
+        self.vocab_scores.store(index, score)
+        self.vocab.store(index, token)
 
     # sort vocab by string_compare
     fn sort(inout self) -> None:
@@ -378,7 +389,6 @@ struct RunState:
         self.v = TensorSlice(TensorF32(TensorShape(1, config.kv_dim)), 1)
 
 
-
 struct TransformerWeights:
     var token_embedding_table: TensorF32
     var freq_cis_real: TensorF32
@@ -431,21 +441,21 @@ struct TransformerWeights:
 
 
 fn read_file(file_name: String, inout buf: FileBuf) raises:
-    let _os = Python.import_module("os")
-    let ff_size = _os.path.getsize(file_name)
-    let cp_size = string.atol(ff_size.to_string())
-    let cp_buf: BufferPtrType = BufferPtrType.alloc(cp_size)
-    # set window buffer to read binary data from file
-    let f = File(file_name)
-    var reader = BufReader[4096](f ^)
-    var bytes_read = 1
-    var offset = 0
+    var fd = open(file_name, "r")
+    let data = fd.read()
+    fd.close()
 
-    while bytes_read > 0:
-        let buf = Buffer[4096, DType.uint8](cp_buf.offset(offset))
-        bytes_read = reader.read(buf)
-        offset += bytes_read
-    reader.do_nothing()  # keeps lifetimes working
+    let cp_size = data._buffer.size
+    let cp_buf: BufferPtrType = BufferPtrType.alloc(cp_size)
+
+    let data_ptr = data._as_ptr().bitcast[DType.uint8]()
+    
+    for i in range(cp_size):
+        cp_buf.store(i,data_ptr.load(i))
+    
+    # don't free data
+    _ = data
+
     buf.data = cp_buf
     buf.size = cp_size
     buf.offset = 0
@@ -552,49 +562,93 @@ fn softmax(inout x: TensorF32, start: Int, end: Int):
 
 
 @always_inline
-fn matmul_parallelized(C: BufferPtrFloat32,A: BufferPtrFloat32,B: BufferPtrFloat32,rows: Int,cols: Int,):
+fn batch_matmul[
+    n: Int
+](
+    C: StaticTuple[n, BufferPtrFloat32],
+    A: BufferPtrFloat32,
+    B: StaticTuple[n, BufferPtrFloat32],
+    rows: Int,
+    cols: Int,
+):
     @parameter
     fn compute_row(i: Int):
-        var tmp = SIMD[DType.float32, nelts](0)
+        var tmp = StaticTuple[n, SIMD[DType.float32, nelts]]()
+        @parameter
+        fn init[k: Int]():
+            tmp[k] = SIMD[DType.float32, nelts](0)
+        unroll[n, init]()
+        let row_offset = i * cols
 
         @parameter
         fn dot[_nelts: Int](j: Int):
             if _nelts < nelts:  # take care of tail array elements with length <  nelts
-                tmp[0] += (
-                A.simd_load[_nelts](j) * B.simd_load[_nelts](i * cols + j)
-                ).reduce_add()
+                let a = A.simd_load[_nelts](j)
+
+                @parameter
+                fn _multiply_tail[k: Int]():
+                    tmp[k][0] += (
+                        a * B[k].simd_load[_nelts](row_offset + j)
+                    ).reduce_add()
+
+                unroll[n, _multiply_tail]()
             else:
-                tmp += A.simd_load[nelts](j) * B.simd_load[nelts](i * cols + j)
+                let a = A.simd_load[nelts](j)
+
+                @parameter
+                fn _multiply[k: Int]():
+                    tmp[k] += a * B[k].simd_load[nelts](row_offset + j)
+
+                unroll[n, _multiply]()
 
         vectorize[nelts, dot](cols)
-        C.store(i, tmp.reduce_add())
-    
+
+        @parameter
+        fn _reduce[k: Int]():
+            C[k].store(i, tmp[k].reduce_add())
+
+        unroll[n, _reduce]()
 
     parallelize[compute_row](rows, workers)
 
-    
 
-    
-    
 @always_inline
 fn matmul(C: TensorF32, A: TensorF32, B: TensorF32) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
+    batch_matmul[1](
+        StaticTuple[1, BufferPtrFloat32](C.data()),
+        A.data(),
+        StaticTuple[1, BufferPtrFloat32](B.data()),
+        B.dim(0),
+        B.dim(1),
+    )
 
 
 @always_inline
 fn matmul(C: TensorF32, A: TensorF32, B: TensorSlice) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
+    batch_matmul[1](
+        StaticTuple[1, BufferPtrFloat32](C.data()),
+        A.data(),
+        StaticTuple[1, BufferPtrFloat32](B.data()),
+        B.dim(0),
+        B.dim(1),
+    )
 
 
 @always_inline
 fn matmul(C: TensorSlice, A: TensorF32, B: TensorSlice) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
+    batch_matmul[1](
+        StaticTuple[1, BufferPtrFloat32](C.data(),),
+        A.data(),
+        StaticTuple[1, BufferPtrFloat32](B.data()),
+        B.dim(0),
+        B.dim(1),
+    )
 
 
 fn matmul_dimension_checks(a: TensorShape, b: TensorShape) raises:
@@ -697,14 +751,34 @@ fn transformer(
         # Attention rmsnorm
         rmsnorm(state.xb, state.x, TensorSlice(weights.rms_att_weight, l))
         # QKV matmuls for this position
-        matmul(state.q, state.xb, TensorSlice(weights.wq, l))
-
         let loff = l * config.seq_len * config.kv_dim
         state.k = TensorSlice(state.key_cache, l, pos)
-        matmul(state.k, state.xb, TensorSlice(weights.wk, l))
-
         state.v = TensorSlice(state.value_cache, l, pos)
-        matmul(state.v, state.xb, TensorSlice(weights.wv, l))
+        if kv_dim == dim:
+            batch_matmul[3](
+                StaticTuple[3, BufferPtrFloat32](
+                    state.q.data(), state.k.data(), state.v.data()
+                ),
+                state.xb.data(),
+                StaticTuple[3, BufferPtrFloat32](
+                    TensorSlice(weights.wq, l).data(),
+                    TensorSlice(weights.wk, l).data(),
+                    TensorSlice(weights.wv, l).data(),
+                ),
+                dim,
+                dim,
+            )
+        else:
+            matmul(state.q, state.xb, TensorSlice(weights.wq, l))
+            batch_matmul[2](
+                StaticTuple[2, BufferPtrFloat32](state.k.data(), state.v.data()),
+                state.xb.data(),
+                StaticTuple[2, BufferPtrFloat32](
+                    TensorSlice(weights.wk, l).data(), TensorSlice(weights.wv, l).data()
+                ),
+                kv_dim,
+                dim,
+            )
 
         # Apply RoPE rotation to the q and k vectors for each head
         rope_rotation_llama(state, freq_cis_real_row, freq_cis_imag_row, config)
@@ -770,9 +844,15 @@ fn transformer(
         rmsnorm(state.xb, state.x, TensorSlice(weights.rms_ffn_weight, l))
 
         # Calculate self.w1(x) and self.w3(x) for FFN
-        matmul(state.hb, state.xb, TensorSlice(weights.w1, l))
-
-        matmul(state.hb2, state.xb, TensorSlice(weights.w3, l))
+        batch_matmul[2](
+            StaticTuple[2, BufferPtrFloat32](state.hb.data(), state.hb2.data()),
+            state.xb.data(),
+            StaticTuple[2, BufferPtrFloat32](
+                TensorSlice(weights.w1, l).data(), TensorSlice(weights.w3, l).data()
+            ),
+            hidden_dim,
+            dim,
+        )
 
         @parameter
         fn silu[_nelts: Int](i: Int):
@@ -811,12 +891,11 @@ fn sample(probabilities: TensorF32) -> Int:
     let n = probabilities.dim(0)
     # Sample index from probabilities, they must sum to 1
     # get random value within (min, max) float32 range
-    let r = DTypePointer[DType.float32].alloc(1)
-    rand[DType.float32](r, 1)
+    let r = rand[DType.float32](1)
     var cdf: Float32 = 0.0
     for i in range(n):
         cdf += probabilities[i]
-        if r.load(0) < cdf:
+        if r[0] < cdf:
             return i
     return n - 1  # In case of rounding errors
 
@@ -825,7 +904,6 @@ fn bpe_encode(inout tokens: DynamicVector[Int], text: String, inout tok: Tokeniz
     for pos in range(len(text)):
         let char = str_to_ptr(text[pos])
         let id = tok.find(char)
-
         if id == -1:
             print("Not a good prompt token at pos ", pos)
             return
