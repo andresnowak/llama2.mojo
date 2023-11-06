@@ -719,7 +719,8 @@ fn rope_rotation_llama(
         for j in range(head_range, config.head_size, 2):
             calc_head[1](j)
 
-    parallelize[head_loop](config.n_heads, workers)
+    for i in range(config.n_heads):
+        head_loop(i)
 
 
 
